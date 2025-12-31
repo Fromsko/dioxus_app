@@ -1,0 +1,167 @@
+name: Android Build
+
+on:
+  push:
+    branches: [main, master]
+    tags:
+      - "v*"
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  APP_NAME: dioxus_app
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 9477386
+
+      - name: Install Android NDK and Build Tools
+        run: |
+          echo "y" | sdkmanager --install "ndk;26.1.10909125" "build-tools;34.0.0" "platforms;android-34"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.1.10909125" >> $GITHUB_ENV
+          echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.1.10909125" >> $GITHUB_ENV
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - name: Install cargo-apk
+        run: cargo install cargo-apk
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Configure Android metadata in Cargo.toml
+        run: |
+          cat >> Cargo.toml << 'EOF'
+
+          [package.metadata.android]
+          package = "com.dioxus.app"
+          build_targets = ["aarch64-linux-android", "armv7-linux-androideabi"]
+
+          [package.metadata.android.sdk]
+          min_sdk_version = 24
+          target_sdk_version = 34
+          compile_sdk_version = 34
+
+          [[package.metadata.android.uses_permission]]
+          name = "android.permission.INTERNET"
+
+          [[package.metadata.android.uses_permission]]
+          name = "android.permission.ACCESS_NETWORK_STATE"
+
+          [package.metadata.android.application]
+          label = "Dioxus App"
+          icon = "@mipmap/ic_launcher"
+          theme = "@android:style/Theme.DeviceDefault.NoActionBar"
+          EOF
+
+      - name: Build APK for ARM64
+        run: |
+          cargo apk build --release --target aarch64-linux-android
+
+      - name: Build APK for ARMv7
+        run: |
+          cargo apk build --release --target armv7-linux-androideabi
+
+      - name: Generate debug keystore for signing
+        run: |
+          keytool -genkey -v -keystore ~/.android/debug.keystore \
+            -storepass android -alias androiddebugkey \
+            -keypass android -keyalg RSA -keysize 2048 \
+            -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+
+      - name: Find, sign and rename APKs
+        run: |
+          mkdir -p apk-output
+          find target -name "*.apk" -type f -exec cp {} apk-output/ \;
+          cd apk-output
+
+          # 处理每个 APK
+          for apk in *.apk; do
+            echo "Processing $apk..."
+            
+            # 签名 APK
+            jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 \
+              -keystore ~/.android/debug.keystore -storepass android -keypass android \
+              "$apk" androiddebugkey
+            
+            # 对齐 APK（提高性能）
+            $ANDROID_SDK_ROOT/build-tools/34.0.0/zipalign -v 4 "$apk" "aligned-$apk"
+            
+            # 根据架构重命名
+            if [[ $apk == *"arm64"* ]] || [[ $apk == *"aarch64"* ]]; then
+              mv "aligned-$apk" "${APP_NAME}-arm64-v8a.apk"
+            elif [[ $apk == *"armv7"* ]] || [[ $apk == *"armeabi"* ]]; then
+              mv "aligned-$apk" "${APP_NAME}-armeabi-v7a.apk"
+            fi
+            
+            # 清理原始文件
+            rm -f "$apk"
+          done
+
+          echo "✅ APK 签名完成！"
+          ls -lh
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apks
+          path: apk-output/*.apk
+          if-no-files-found: error
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: apk-output/*.apk
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## 📱 Android APK 下载
+
+            - **arm64-v8a**: 适用于现代 64 位 Android 设备（推荐）
+            - **armeabi-v7a**: 适用于旧款 32 位 Android 设备
+
+            ### 安装说明
+            1. 下载对应架构的 APK
+            2. 在手机上允许安装未知来源应用
+            3. 安装并运行
+
+            ⚠️ 使用 debug 签名，仅供开发和个人使用
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
